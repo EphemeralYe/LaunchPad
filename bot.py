@@ -148,7 +148,7 @@ def start_tunnel():
         return "Tunnel started (URL not detected)"
 
     except FileNotFoundError:
-        return "⚠️ cloudflared not installed""
+        return "⚠️ cloudflared not installed"
 
 # ─── DEPLOY ─────────────────────────
 async def safe_deploy(*args):
