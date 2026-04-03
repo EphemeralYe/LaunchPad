@@ -16,11 +16,11 @@ from telethon import TelegramClient, events, Button
 from telethon.tl.types import Message
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
-API_ID    = int(os.environ.get("API_ID", 0))
-API_HASH  = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+API_ID = int(os.environ.get("API_ID", 767371))          # From https://my.telegram.org
+API_HASH = os.environ.get("API_HASH", "1a13288b823e1ac0db1d8c3dfb49b95a")           # From https://my.telegram.org
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "7880763749:AAEq8czTTs5YHXppwpFVGR1_rLbxFyD9Xio")         # From @BotFather
 DEPLOY_DIR = Path(os.environ.get("DEPLOY_DIR", "./deployments"))
-DATA_FILE  = Path("repos.json")
+DATA_FILE = Path("repos.json")
 # ───────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
