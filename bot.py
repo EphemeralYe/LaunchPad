@@ -10,7 +10,7 @@ import time
 import hashlib
 import psutil
 from pathlib import Path
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 
 # ─── CONFIG ─────────────────────────
 API_ID = int(os.environ.get("API_ID", 767371))          # From https://my.telegram.org
@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 DEPLOY_DIR.mkdir(parents=True, exist_ok=True)
 
 # ─── DATA ───────────────────────────
+waiting = {}
 def load_data():
     if DATA_FILE.exists():
         return json.load(open(DATA_FILE))
@@ -168,28 +169,105 @@ def cleanup():
 # ─── TELEGRAM ───────────────────────
 client = TelegramClient("bot", API_ID, API_HASH)
 
+def build_main_menu(user_id):
+    repos = get_user_repos(user_id)
+    buttons = []
+
+    for name, info in repos.items():
+        buttons.append([
+            Button.inline(f"📦 {name}", data=f"repo:{name}")
+        ])
+    buttons.append([Button.inline("➕ Add Repo", data="add_repo")])
+    return buttons
+
+def build_repo_menu(name):
+    return [
+        [Button.inline("🚀 Deploy", data=f"deploy:{name}")],
+        [Button.inline("⏹ Stop", data=f"stop:{name}")],
+        [Button.inline("📋 Logs", data=f"logs:{name}")],
+        [Button.inline("◀️ Back", data="back")]
+    ]
+    
 @client.on(events.NewMessage(pattern="/start"))
 async def start(e):
-    await e.respond("Send repo URL")
+    await e.respond(
+        "🖥 Hosting Dashboard",
+        buttons=build_main_menu(e.sender_id)
+    )
 
+@client.on(events.CallbackQuery(pattern=b"repo:(.+)"))
+async def repo_menu(e):
+    name = e.data.decode().split(":")[1]
+
+    await e.edit(
+        f"📦 {name}\nChoose action:",
+        buttons=build_repo_menu(name)
+    )
+
+@client.on(events.CallbackQuery(pattern=b"deploy:(.+)"))
+async def cb_deploy(e):
+    name = e.data.decode().split(":")[1]
+    repo = get_user_repos(e.sender_id).get(name)
+
+    msg = await e.edit(f"🚀 Deploying {name}...")
+    asyncio.create_task(
+        deploy(msg, e.sender_id, name, repo["url"])
+    )
+
+@client.on(events.CallbackQuery(pattern=b"stop:(.+)"))
+async def cb_stop(e):
+    name = e.data.decode().split(":")[1]
+    repo = get_user_repos(e.sender_id).get(name)
+
+    pid = repo.get("pid")
+    if pid:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    await e.edit(f"⏹ Stopped {name}")
+    
+@client.on(events.CallbackQuery(pattern=b"logs:(.+)"))
+async def cb_logs(e):
+    name = e.data.decode().split(":")[1]
+    path = DEPLOY_DIR / str(e.sender_id) / name / "deploy.log"
+
+    if not path.exists():
+        return await e.answer("No logs yet", alert=True)
+
+    with open(path) as f:
+        data = f.readlines()[-30:]
+    await e.edit(
+        f"📋 Logs:\n\n```\n{''.join(data)[-3000:]}\n```",
+        buttons=[[Button.inline("◀️ Back", data=f"repo:{name}")]]
+    )
+
+@client.on(events.CallbackQuery(data=b"back"))
+async def back(e):
+    await e.edit(
+        "🖥 Hosting Dashboard",
+        buttons=build_main_menu(e.sender_id)
+    )
+
+@client.on(events.CallbackQuery(data=b"add_repo"))
+async def add_repo(e):
+    waiting[e.sender_id] = True
+    await e.edit("Send repo URL")
+
+@client.on(events.NewMessage)
+async def receive_repo(e):
+    if not waiting.get(e.sender_id):
+        return
+
+    waiting.pop(e.sender_id)
+
+    url = e.text
+    name = url.split("/")[-1].replace(".git","")
+
+    set_user_repo(e.sender_id, name, {"url": url, "pid":0})
+
+    await e.respond("✅ Added!", buttons=build_main_menu(e.sender_id))
+    
 @client.on(events.NewMessage(pattern="/stats"))
 async def stats(e):
     await e.respond(get_stats())
-
-@client.on(events.NewMessage)
-async def add(e):
-    if "github.com" in e.text:
-        name = e.text.split("/")[-1].replace(".git","")
-        set_user_repo(e.sender_id, name, {"url": e.text})
-        await e.respond(f"Added {name}")
-
-@client.on(events.NewMessage(pattern="/deploy (.+)"))
-async def deploy_cmd(e):
-    name = e.pattern_match.group(1)
-    repo = get_user_repos(e.sender_id).get(name)
-
-    msg = await e.respond("Starting...")
-    asyncio.create_task(deploy(msg, e.sender_id, name, repo["url"]))
 
 # ─── MAIN ───────────────────────────
 async def main():
