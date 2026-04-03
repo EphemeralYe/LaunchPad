@@ -175,6 +175,8 @@ def stop_process(uid, name):
             proc.kill()
 
 # ─── TUNNEL ─────────────────────────
+import re
+
 def start_tunnel():
     try:
         p = subprocess.Popen(
@@ -183,10 +185,15 @@ def start_tunnel():
             stderr=subprocess.STDOUT,
             text=True
         )
+
         for line in p.stdout:
-            if "trycloudflare.com" in line:
-                return line.strip()
-        return "Tunnel started"
+            # 🔥 extract actual URL only
+            match = re.search(r"https://[a-zA-Z0-9\-]+\.trycloudflare\.com", line)
+            if match:
+                return match.group(0)
+
+        return "Tunnel started (URL not found)"
+
     except FileNotFoundError:
         return "⚠️ cloudflared not installed"
 
