@@ -6,13 +6,16 @@ import json
 import logging
 import sys
 import shutil
+import time
+import hashlib
+import psutil
 from pathlib import Path
-from telethon import TelegramClient, events, Button
+from telethon import TelegramClient, events
 
-# ─── CONFIG ─────────────────────────────────────────
-API_ID = int(os.environ.get("API_ID", 767371))          # From https://my.telegram.org
-API_HASH = os.environ.get("API_HASH", "1a13288b823e1ac0db1d8c3dfb49b95a")           # From https://my.telegram.org
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "7880763749:AAEq8czTTs5YHXppwpFVGR1_rLbxFyD9Xio")         # From @BotFather
+# ─── CONFIG ─────────────────────────
+API_ID     = int(os.environ.get("API_ID", 0))
+API_HASH   = os.environ.get("API_HASH", "")
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
 DEPLOY_DIR = Path("./deployments")
 DATA_FILE  = Path("repos.json")
 
@@ -20,7 +23,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 DEPLOY_DIR.mkdir(parents=True, exist_ok=True)
 
-# ─── DATA ───────────────────────────────────────────
+# ─── DATA ───────────────────────────
 def load_data():
     if DATA_FILE.exists():
         return json.load(open(DATA_FILE))
@@ -37,159 +40,164 @@ def set_user_repo(uid, name, info):
     data.setdefault(str(uid), {})[name] = info
     save_data(data)
 
-def delete_user_repo(uid, name):
-    data = load_data()
-    if str(uid) in data and name in data[str(uid)]:
-        del data[str(uid)][name]
-        save_data(data)
+# ─── STATS ──────────────────────────
+def get_stats():
+    cpu = psutil.cpu_percent()
+    ram = psutil.virtual_memory().percent
+    uptime = time.time() - psutil.boot_time()
+    return f"📊 CPU: {cpu}% | RAM: {ram}% | Uptime: {int(uptime//3600)}h"
 
-# ─── PROCESS ────────────────────────────────────────
-def is_running(pid):
-    try:
-        os.kill(pid, 0)
-        return True
-    except:
-        return False
+# ─── LOG ROTATION ───────────────────
+def rotate_log(path):
+    if path.exists() and path.stat().st_size > 5_000_000:
+        path.rename(path.with_suffix(".old"))
 
-def stop_process(pid):
-    try:
-        os.killpg(os.getpgid(pid), signal.SIGTERM)
-        return True
-    except:
-        return False
+# ─── HASH CACHE ─────────────────────
+def get_req_hash(repo):
+    req = repo / "requirements.txt"
+    if not req.exists():
+        return None
+    return hashlib.md5(req.read_bytes()).hexdigest()
 
-# ─── GIT ────────────────────────────────────────────
-def clone_or_pull(url, dest, log):
-    if (dest / ".git").exists():
-        r = subprocess.run(["git", "-C", str(dest), "pull"], capture_output=True, text=True)
-        return r.returncode == 0, r.stdout
-    r = subprocess.run(["git", "clone", url, str(dest)], capture_output=True, text=True)
-    return r.returncode == 0, r.stdout or r.stderr
-
-# ─── VENV (FIXED) ───────────────────────────────────
+# ─── VENV ───────────────────────────
 def venv_python(repo):
     return repo / ".venv/bin/python"
 
-def create_venv(repo, log):
+def create_venv(repo):
     venv = repo / ".venv"
     py = venv / "bin/python"
 
     if venv.exists():
         if py.exists():
             subprocess.run([str(py), "-m", "ensurepip"], capture_output=True)
-            return True, "Reused venv"
+            return True
         shutil.rmtree(venv)
 
-    r = subprocess.run([sys.executable, "-m", "venv", str(venv)])
-    if r.returncode != 0:
-        return False, "venv failed"
-
+    subprocess.run([sys.executable, "-m", "venv", str(venv)])
     subprocess.run([str(py), "-m", "ensurepip"], capture_output=True)
-    return True, "Created venv"
+    return True
 
-# ─── INSTALL (FIXED) ────────────────────────────────
-def install_python_deps(repo, log):
+# ─── INSTALL ────────────────────────
+def install_deps(repo, log):
     py = venv_python(repo)
-    if not py.exists():
-        return False, "No python in venv"
 
     def pip(args):
         return [str(py), "-m", "pip"] + args
 
-    subprocess.run(pip(["install", "--upgrade", "pip", "setuptools"]))
+    subprocess.run(pip(["install", "--upgrade", "pip"]))
+
+    new_hash = get_req_hash(repo)
+    hash_file = repo / ".req_hash"
+    old_hash = hash_file.read_text() if hash_file.exists() else None
+
+    if new_hash == old_hash:
+        log.write("[pip] ⚡ Cache hit\n")
+        return True
 
     req = repo / "requirements.txt"
     if req.exists():
-        r = subprocess.run(pip(["install", "-r", str(req)]), capture_output=True, text=True)
+        r = subprocess.run(pip(["install", "-r", str(req)]))
         if r.returncode != 0:
-            return False, r.stderr
+            return False
 
-    return True, "Deps installed"
+    hash_file.write_text(new_hash or "")
+    return True
 
-# ─── START ──────────────────────────────────────────
+# ─── AUTO RESTART ───────────────────
 def start_process(repo, log):
-    py = str(venv_python(repo)) if venv_python(repo).exists() else "python3"
+    py = str(venv_python(repo))
 
-    for cmd, file in [
-        ([py, "main.py"], "main.py"),
-        ([py, "app.py"], "app.py"),
-        (["node", "index.js"], "index.js"),
-    ]:
-        if (repo / file).exists():
-            p = subprocess.Popen(cmd, cwd=str(repo),
-                                 stdout=log, stderr=log,
-                                 start_new_session=True)
-            return True, file, p.pid
+    def run():
+        while True:
+            p = subprocess.Popen([py, "main.py"], cwd=str(repo),
+                                 stdout=log, stderr=log)
+            p.wait()
+            log.write("🔁 Restarting...\n")
+            time.sleep(3)
 
-    return False, "No start file", 0
+    subprocess.Popen(["python3", "-c",
+                      f"import threading; threading.Thread(target={run}).start()"])
 
-# ─── PIPELINE ───────────────────────────────────────
-async def run_deploy_pipeline(event, uid, name, url):
+    return True, "Started"
+
+# ─── CLOUDFLARE ─────────────────────
+def start_tunnel():
+    p = subprocess.Popen(
+        ["cloudflared", "tunnel", "--url", "http://localhost:8000"],
+        stdout=subprocess.PIPE, text=True
+    )
+    for line in p.stdout:
+        if "trycloudflare.com" in line:
+            return line.strip()
+    return "No URL"
+
+# ─── DEPLOY ─────────────────────────
+async def deploy(event, uid, name, url):
     repo = DEPLOY_DIR / str(uid) / name
     repo.mkdir(parents=True, exist_ok=True)
 
     log_path = repo / "deploy.log"
+    rotate_log(log_path)
 
     with open(log_path, "a") as log:
 
         await event.edit("📥 Cloning...")
-        ok, msg = clone_or_pull(url, repo, log)
-        if not ok:
-            return False, msg, 0
+        subprocess.run(["git", "clone", url, str(repo)])
 
-        await event.edit("🐍 Creating venv...")
-        ok, msg = create_venv(repo, log)
-        if not ok:
-            return False, msg, 0
+        await event.edit("🐍 Venv...")
+        create_venv(repo)
 
-        await event.edit("📦 Installing deps...")
-        ok, msg = install_python_deps(repo, log)
-        if not ok:
-            return False, msg, 0
+        await event.edit("📦 Installing...")
+        if not install_deps(repo, log):
+            return await event.edit("❌ Install failed")
 
         await event.edit("🚀 Starting...")
-        ok, msg, pid = start_process(repo, log)
-        if not ok:
-            return False, msg, 0
+        start_process(repo, log)
 
-    return True, "Deployed", pid
+        url = start_tunnel()
 
-# ─── TELEGRAM ───────────────────────────────────────
+    await event.edit(f"✅ Deployed!\n🌍 {url}")
+
+# ─── CLEANUP ────────────────────────
+def cleanup():
+    for user in DEPLOY_DIR.iterdir():
+        for repo in user.iterdir():
+            if time.time() - repo.stat().st_mtime > 86400:
+                shutil.rmtree(repo)
+
+# ─── TELEGRAM ───────────────────────
 client = TelegramClient("bot", API_ID, API_HASH)
 
 @client.on(events.NewMessage(pattern="/start"))
 async def start(e):
     await e.respond("Send repo URL")
 
+@client.on(events.NewMessage(pattern="/stats"))
+async def stats(e):
+    await e.respond(get_stats())
+
 @client.on(events.NewMessage)
 async def add(e):
     if "github.com" in e.text:
         name = e.text.split("/")[-1].replace(".git","")
-        set_user_repo(e.sender_id, name, {"url": e.text, "pid":0})
+        set_user_repo(e.sender_id, name, {"url": e.text})
         await e.respond(f"Added {name}")
 
 @client.on(events.NewMessage(pattern="/deploy (.+)"))
-async def deploy(e):
+async def deploy_cmd(e):
     name = e.pattern_match.group(1)
     repo = get_user_repos(e.sender_id).get(name)
-    if not repo:
-        return await e.respond("Not found")
 
     msg = await e.respond("Starting...")
-    ok, detail, pid = await run_deploy_pipeline(msg, e.sender_id, name, repo["url"])
+    asyncio.create_task(deploy(msg, e.sender_id, name, repo["url"]))
 
-    if ok:
-        repo["pid"] = pid
-        set_user_repo(e.sender_id, name, repo)
-        await msg.edit("✅ Deployed")
-    else:
-        await msg.edit(f"❌ {detail}")
-
-# ─── MAIN ───────────────────────────────────────────
+# ─── MAIN ───────────────────────────
 async def main():
     await client.start(bot_token=BOT_TOKEN)
     print("Bot running...")
-    await client.run_until_disconnected()
+    while True:
+        cleanup()
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     asyncio.run(main())
