@@ -8,6 +8,7 @@ import sys
 import shutil
 import time
 import hashlib
+import threading
 import psutil
 from pathlib import Path
 from telethon import TelegramClient, events, Button
@@ -110,29 +111,52 @@ def start_process(repo, log):
 
     def run():
         while True:
-            p = subprocess.Popen([py, "main.py"], cwd=str(repo),
-                                 stdout=log, stderr=log)
-            p.wait()
-            log.write("🔁 Restarting...\n")
-            time.sleep(3)
+            try:
+                p = subprocess.Popen(
+                    [py, "main.py"],
+                    cwd=str(repo),
+                    stdout=log,
+                    stderr=log
+                )
+                p.wait()
+                log.write("🔁 Restarting...\n")
+                log.flush()
+                time.sleep(3)
+            except Exception as e:
+                log.write(f"[error] {e}\n")
+                time.sleep(5)
 
-    subprocess.Popen(["python3", "-c",
-                      f"import threading; threading.Thread(target={run}).start()"])
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
 
-    return True, "Started"
+    return True, "Auto-restart enabled", 0
 
 # ─── CLOUDFLARE ─────────────────────
 def start_tunnel():
-    p = subprocess.Popen(
-        ["cloudflared", "tunnel", "--url", "http://localhost:8000"],
-        stdout=subprocess.PIPE, text=True
-    )
-    for line in p.stdout:
-        if "trycloudflare.com" in line:
-            return line.strip()
-    return "No URL"
+    try:
+        p = subprocess.Popen(
+            ["cloudflared", "tunnel", "--url", "http://localhost:8000"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True
+        )
+
+        for line in p.stdout:
+            if "trycloudflare.com" in line:
+                return line.strip()
+
+        return "Tunnel started (URL not detected)"
+
+    except FileNotFoundError:
+        return "⚠️ cloudflared not installed""
 
 # ─── DEPLOY ─────────────────────────
+async def safe_deploy(*args):
+    try:
+        await deploy(*args)
+    except Exception as e:
+        print("DEPLOY ERROR:", e)
+        
 async def deploy(event, uid, name, url):
     repo = DEPLOY_DIR / str(uid) / name
     repo.mkdir(parents=True, exist_ok=True)
@@ -211,7 +235,7 @@ async def cb_deploy(e):
 
     msg = await e.edit(f"🚀 Deploying {name}...")
     asyncio.create_task(
-        deploy(msg, e.sender_id, name, repo["url"])
+        safe_deploy(msg, e.sender_id, name, repo["url"])
     )
 
 @client.on(events.CallbackQuery(pattern=b"stop:(.+)"))
