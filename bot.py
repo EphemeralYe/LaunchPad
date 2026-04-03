@@ -19,6 +19,7 @@ API_HASH = os.environ.get("API_HASH", "1a13288b823e1ac0db1d8c3dfb49b95a")       
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "7880763749:AAEq8czTTs5YHXppwpFVGR1_rLbxFyD9Xio")         # From @BotFather
 
 DEPLOY_DIR = Path("./deployments")
+DEPLOY_DIR = Path("./deployments")
 DATA_FILE  = Path("repos.json")
 
 logging.basicConfig(level=logging.INFO)
@@ -65,29 +66,46 @@ def get_valid_python(repo):
     py = repo / ".venv/bin/python"
     if not py.exists():
         return None
-    r = subprocess.run([str(py), "--version"], capture_output=True)
-    return py if r.returncode == 0 else None
+    try:
+        r = subprocess.run([str(py), "--version"], capture_output=True)
+        if r.returncode != 0:
+            return None
+    except:
+        return None
+    return py
 
 def create_venv(repo, log):
     venv = repo / ".venv"
+
+    py = get_valid_python(repo)
+    if py is None and venv.exists():
+        log.write("[venv] ❌ Broken venv — deleting\n")
+        shutil.rmtree(venv, ignore_errors=True)
+
+    if not venv.exists():
+        log.write("[venv] Creating new venv...\n")
+        r = subprocess.run([sys.executable, "-m", "venv", str(venv)])
+        if r.returncode != 0:
+            return False
+
     py = venv / "bin/python"
-
-    if py.exists():
-        if subprocess.run([str(py), "--version"]).returncode == 0:
-            log.write("[venv] OK\n")
-            return True
-        shutil.rmtree(venv)
-
-    subprocess.run([sys.executable, "-m", "venv", str(venv)])
     subprocess.run([str(py), "-m", "ensurepip"], capture_output=True)
 
-    return py.exists()
+    if not py.exists():
+        return False
+
+    log.write("[venv] ✅ Ready\n")
+    return True
 
 # ─── INSTALL ────────────────────────
 def install_deps(repo, log):
     py = get_valid_python(repo)
+
     if not py:
-        return False
+        log.write("[pip] ⚠️ Python missing — rebuilding venv\n")
+        if not create_venv(repo, log):
+            return False
+        py = get_valid_python(repo)
 
     def pip(args):
         return [str(py), "-m", "pip"] + args
@@ -98,9 +116,11 @@ def install_deps(repo, log):
     hash_file = repo / ".req_hash"
     old_hash = hash_file.read_text() if hash_file.exists() else None
 
-    if new_hash == old_hash:
+    if new_hash == old_hash and py:
         log.write("[pip] ⚡ Cache hit\n")
         return True
+
+    log.write("[pip] Installing dependencies...\n")
 
     req = repo / "requirements.txt"
     if req.exists():
@@ -111,29 +131,48 @@ def install_deps(repo, log):
     hash_file.write_text(new_hash or "")
     return True
 
-# ─── START PROCESS ──────────────────
-def start_process(repo, log):
+# ─── PROCESS ────────────────────────
+running_processes = {}
+
+def start_process(repo, log, uid, name):
     py = get_valid_python(repo)
+
     if not py:
-        return False, "No python", 0
+        log.write("[start] ❌ Python missing — rebuilding venv\n")
+        if not create_venv(repo, log):
+            return False, "Venv broken", 0
+        py = get_valid_python(repo)
 
     def runner():
         while True:
-            p = subprocess.Popen(
-                [str(py), "main.py"],
-                cwd=str(repo),
-                stdout=log,
-                stderr=log
-            )
-            p.wait()
-            log.write("🔁 Restarting...\n")
-            log.flush()
-            time.sleep(3)
+            try:
+                p = subprocess.Popen(
+                    [str(py), "main.py"],
+                    cwd=str(repo),
+                    stdout=log,
+                    stderr=log
+                )
+                running_processes[(uid, name)] = p
+                p.wait()
+                log.write("🔁 Restarting...\n")
+                log.flush()
+                time.sleep(3)
+            except Exception as e:
+                log.write(f"[error] {e}\n")
+                time.sleep(5)
 
     t = threading.Thread(target=runner, daemon=True)
     t.start()
 
     return True, "Running", 0
+
+def stop_process(uid, name):
+    proc = running_processes.get((uid, name))
+    if proc:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except:
+            proc.kill()
 
 # ─── TUNNEL ─────────────────────────
 def start_tunnel():
@@ -160,23 +199,29 @@ async def deploy(event, uid, name, url):
     rotate_log(log_path)
 
     with open(log_path, "a") as log:
-
         await event.edit("📥 Cloning...")
         subprocess.run(["git", "-C", str(repo), "pull"])
 
         await event.edit("🐍 Venv...")
-        create_venv(repo, log)
+        if not create_venv(repo, log):
+            return await event.edit("❌ Venv failed")
 
         await event.edit("📦 Installing...")
         if not install_deps(repo, log):
             return await event.edit("❌ Install failed")
 
         await event.edit("🚀 Starting...")
-        start_process(repo, log)
+        start_process(repo, log, uid, name)
 
         url = start_tunnel()
 
     await event.edit(f"✅ Deployed!\n🌍 {url}")
+
+async def safe_deploy(*args):
+    try:
+        await deploy(*args)
+    except Exception as e:
+        print("DEPLOY ERROR:", e)
 
 # ─── UI ─────────────────────────────
 def build_main_menu(uid):
@@ -184,6 +229,7 @@ def build_main_menu(uid):
     btns = [[Button.inline(f"📦 {r}", data=f"repo:{r}")]
             for r in repos]
     btns.append([Button.inline("➕ Add Repo", data="add")])
+    btns.append([Button.inline("📊 Stats", data="stats")])
     return btns
 
 def build_repo_menu(name):
@@ -202,9 +248,9 @@ waiting = {}
 async def start(e):
     await e.respond("🖥 Dashboard", buttons=build_main_menu(e.sender_id))
 
-@client.on(events.NewMessage(pattern="/stats"))
-async def stats(e):
-    await e.respond(get_stats())
+@client.on(events.CallbackQuery(data=b"stats"))
+async def stats_btn(e):
+    await e.answer(get_stats(), alert=True)
 
 @client.on(events.CallbackQuery(data=b"add"))
 async def add_repo(e):
@@ -234,11 +280,13 @@ async def cb_deploy(e):
     repo = get_user_repos(e.sender_id)[name]
 
     msg = await e.edit("🚀 Deploying...")
-    asyncio.create_task(deploy(msg, e.sender_id, name, repo["url"]))
+    asyncio.create_task(safe_deploy(msg, e.sender_id, name, repo["url"]))
 
 @client.on(events.CallbackQuery(pattern=b"stop:(.+)"))
 async def stop(e):
-    await e.edit("⏹ Stopped")
+    name = e.data.decode().split(":")[1]
+    stop_process(e.sender_id, name)
+    await e.edit(f"⏹ Stopped {name}")
 
 @client.on(events.CallbackQuery(pattern=b"logs:(.+)"))
 async def logs(e):
